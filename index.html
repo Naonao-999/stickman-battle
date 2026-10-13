@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>火柴人大战 · Stickman Battle</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0;}
+  html,body{height:100%;}
+  body{
+    background:#0b0b14;
+    display:flex;align-items:center;justify-content:center;
+    font-family:'Segoe UI','Microsoft YaHei',system-ui,-apple-system,sans-serif;
+    overflow:hidden;
+  }
+  #wrap{
+    position:relative;
+    width:min(96vw, calc(96vh * 16 / 9));
+  }
+  canvas{
+    display:block;width:100%;height:auto;
+    background:#1a1a2e;border-radius:10px;
+    box-shadow:0 12px 60px rgba(0,0,0,.65);
+  }
+  #overlay{
+    position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+    background:rgba(8,10,20,.74);backdrop-filter:blur(3px);
+    border-radius:10px;cursor:pointer;z-index:5;text-align:center;
+  }
+  .panel{color:#fff;padding:24px;}
+  .panel h1{font-size:clamp(30px,6vw,46px);letter-spacing:2px;margin-bottom:6px;text-shadow:0 2px 24px rgba(255,255,255,.28);}
+  .panel .sub{color:#9fd0ff;margin-bottom:24px;font-size:16px;}
+  .controls{display:flex;gap:48px;justify-content:center;text-align:left;margin-bottom:26px;flex-wrap:wrap;}
+  .controls .col h3{margin-bottom:10px;font-size:18px;}
+  .controls .row{display:flex;justify-content:space-between;gap:20px;font-size:14px;color:#cfe0f5;margin:6px 0;}
+  .controls kbd{background:#1f2740;border:1px solid #3a4a6b;border-bottom-width:2px;border-radius:5px;padding:1px 8px;font-family:inherit;color:#fff;white-space:nowrap;}
+  .panel button{
+    padding:13px 46px;font-size:18px;font-weight:700;color:#0b0b14;
+    background:linear-gradient(180deg,#ffd76a,#ff9a3c);border:none;border-radius:30px;
+    cursor:pointer;box-shadow:0 6px 22px rgba(255,170,60,.42);font-family:inherit;
+  }
+  .panel button:hover{filter:brightness(1.08);}
+  .hint{margin-top:18px;color:#8fa6c9;font-size:13px;}
+  #muteBtn{
+    position:absolute;right:10px;bottom:10px;z-index:6;
+    background:rgba(0,0,0,.4);border:1px solid #3a4a6b;color:#fff;
+    border-radius:6px;padding:5px 10px;cursor:pointer;font-size:14px;font-family:inherit;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div id="overlay"></div>
+  <button id="muteBtn" title="静音">🔊</button>
+</div>
+
+<script>
+(() => {
+'use strict';
+
+// ==================== 基础设置 ====================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = 960, H = 540;
+
+const overlay = document.getElementById('overlay');
+const muteBtn = document.getElementById('muteBtn');
+
+// ==================== 音效（WebAudio 合成，无需外部文件） ====================
+let audioCtx = null, muted = false;
+function ensureAudio(){
+  if(!audioCtx){
+    try{ audioCtx = new (window.AudioContext || window.webkitAudioContext)(); }catch(e){}
+  }
+}
+function tone(freq, dur, type, vol, slideTo){
+  if(muted) return; ensureAudio(); if(!audioCtx) return;
+  const t0 = audioCtx.currentTime;
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type = type || 'square';
+  o.frequency.setValueAtTime(freq, t0);
+  if(slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t0 + dur);
+  g.gain.setValueAtTime(vol || 0.15, t0);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+  o.connect(g).connect(audioCtx.destination);
+  o.start(t0); o.stop(t0 + dur + 0.02);
+}
+function sfx(name){
+  switch(name){
+    case 'punch': tone(170, 0.09, 'square', 0.16, 80); break;
+    case 'kick':  tone(120, 0.14, 'square', 0.18, 55); break;
+    case 'block': tone(740, 0.06, 'triangle', 0.12); break;
+    case 'jump':  tone(300, 0.09, 'triangle', 0.10, 540); break;
+    case 'ko':    tone(440, 0.5, 'sawtooth', 0.16, 110); break;
+    case 'win':   tone(523, 0.12, 'triangle', 0.15); setTimeout(()=>tone(659,0.12,'triangle',0.15),120); setTimeout(()=>tone(784,0.24,'triangle',0.15),240); break;
+  }
+}
+
+// ==================== 常量 ====================
+const GROUND = 470;
+const GRAVITY = 2300;
+const MOVE_SPEED = 270;
+const JUMP_VEL = 800;
+const ARENA_L = 46, ARENA_R = W - 46;
+const ROUND_TIME = 60;
+
+// 火柴人骨骼尺寸
+const HIP_H = 52, TORSO = 50, NECK = 8, HEAD_R = 14;
+const UPPER_ARM = 26, FORE_ARM = 24, THIGH = 30, SHIN = 30;
+
+// 姿态（面向右侧的局部角度：0=前, PI/2=下, PI=后）
+const POSES = {
+  idle:  { fuA:1.38, fF:1.28, buA:1.82, bF:1.98, fT:1.66, fS:1.60, bT:1.48, bS:1.54 },
+  punch: { fuA:0.02, fF:0.00, buA:2.05, bF:1.60, fT:1.66, fS:1.60, bT:1.48, bS:1.54 },
+  kick:  { fuA:1.55, fF:1.15, buA:2.30, bF:2.10, fT:0.06, fS:0.00, bT:1.80, bS:1.62 },
+  jump:  { fuA:0.50, fF:0.30, buA:2.60, bF:2.85, fT:1.05, fS:1.95, bT:0.85, bS:1.95 },
+  hit:   { fuA:1.95, fF:2.35, buA:1.15, bF:0.85, fT:1.85, fS:1.78, bT:1.22, bS:1.42 },
+  block: { fuA:0.55, fF:0.15, buA:0.95, bF:0.55, fT:1.66, fS:1.60, bT:1.48, bS:1.54 },
+};
+
+const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
+function lerpAngle(a,b,t){
+  let d = b - a;
+  d = Math.atan2(Math.sin(d), Math.cos(d));
+  return a + d * t;
+}
+function roundRect(x,y,w,h,r){
+  ctx.beginPath();
+  ctx.moveTo(x+r,y);
+  ctx.arcTo(x+w,y,x+w,y+h,r);
+  ctx.arcTo(x+w,y+h,x,y+h,r);
+  ctx.arcTo(x,y+h,x,y,r);
+  ctx.arcTo(x,y,x+w,y,r);
+  ctx.closePath();
+}
+
+// ==================== 输入 ====================
+const held = new Set();   // 当前按住的键
+const edge = new Set();   // 本帧刚按下的键
+const P1C = {left:'KeyA',right:'KeyD',up:'KeyW',down:'KeyS',punch:'KeyF',kick:'KeyG'};
+const P2C = {left:'ArrowLeft',right:'ArrowRight',up:'ArrowUp',down:'ArrowDown',punch:'KeyJ',kick:'KeyK'};
+
+window.addEventListener('keydown', e=>{
+  if(e.repeat) return;
+  if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Space'].includes(e.code)) e.preventDefault();
+  if(!held.has(e.code)) edge.add(e.code);
+  held.add(e.code);
+  ensureAudio();
+  if(e.code === 'KeyM'){ muted = !muted; muteBtn.textContent = muted ? '🔇' : '🔊'; }
+  if(e.code === 'Space' || e.code === 'Enter'){
+    if(mode === 'menu' || mode === 'matchover') startMatch();
+  }
+});
+window.addEventListener('keyup', e=> held.delete(e.code));
+
+// ==================== 火柴人 ====================
+class Stickman {
+  constructor(x, color, controls){
+    this.x = x; this.y = GROUND;
+    this.vx = 0; this.vy = 0;
+    this.facing = 1;
+    this.color = color;
+    this.controls = controls;
+    this.hp = 100; this.maxHp = 100;
+    this.state = 'idle'; this.stateTime = 0;
+    this.walkPhase = 0; this.bob = 0;
+    this.hitstun = 0; this.attackCd = 0;
+    this.hasHit = false; this.activeA = 0; this.activeB = 0;
+    this.flash = 0; this.blockFlash = 0;
+    this.angles = {...POSES.idle};
+    this.target = {...POSES.idle};
+    this.lerpRate = 12;
+  }
+  get onGround(){ return this.y >= GROUND - 0.5; }
+  isBlockingNow(){
+    return held.has(this.controls.down) && this.onGround &&
+           this.hitstun <= 0 && this.state !== 'punch' && this.state !== 'kick';
+  }
+  setStatePose(name, rate){
+    this.lerpRate = rate;
+    this.target = POSES[name];
+  }
+  setWalkPose(){
+    this.lerpRate = 14;
+    const s = Math.sin(this.walkPhase) * 0.5;
+    this.target = {
+      fuA:1.45 - s*0.2, fF:1.28,
+      buA:1.72 + s*0.2, bF:1.95,
+      fT:1.57 + s,      fS:1.62 + s*0.55,
+      bT:1.57 - s,      bS:1.62 - s*0.55,
+    };
+  }
+  startAttack(type){
+    this.state = type;
+    this.stateTime = 0;
+    this.hasHit = false;
+    this.vx = 0;
+    if(type === 'punch'){ this.activeA = 0.04; this.activeB = 0.16; this.attackCd = 0.34; }
+    else                { this.activeA = 0.10; this.activeB = 0.30; this.attackCd = 0.55; }
+    sfx(type);
+  }
+  tryHit(enemy){
+    const reach = this.state === 'punch' ? 68 : 82;
+    const dist = Math.abs(enemy.x - this.x);
+    const samePlane = Math.abs(this.y - enemy.y) < 46;
+    const inFront = (enemy.x - this.x) * this.facing > -10;
+    if(dist < reach && samePlane && inFront){
+      this.hasHit = true;
+      const isPunch = this.state === 'punch';
+      const dmg = isPunch ? 8 : 13;
+      const kb = isPunch ? 230 : 430;
+      const hx = this.x + this.facing * reach;
+      const hy = this.y - 92;
+      if(enemy.isBlockingNow()){
+        enemy.blockFlash = 1;
+        enemy.x = clamp(enemy.x + this.facing * kb * 0.18, ARENA_L, ARENA_R);
+        sfx('block');
+        spawnSparks(hx, hy, '#ffffff', 6);
+        shake = 4;
+      } else {
+        enemy.hp -= dmg;
+        enemy.hitstun = isPunch ? 0.26 : 0.42;
+        enemy.state = 'hit'; enemy.stateTime = 0;
+        enemy.flash = 1;
+        enemy.vx = this.facing * kb;
+        enemy.vy = isPunch ? -60 : -180;
+        sfx(isPunch ? 'punch' : 'kick');
+        spawnSparks(hx, hy, enemy.color, 12);
+        shake = 9;
+      }
+    }
+  }
+  applyPhysics(dt){
+    this.vy += GRAVITY * dt;
+    this.x += this.vx * dt;
+    this.y += this.vy * dt;
+    if(this.y >= GROUND){ this.y = GROUND; this.vy = 0; }
+    this.vx *= Math.pow(0.0001, dt); // 击退衰减
+  }
+  update(dt, enemy){
+    this.stateTime += dt;
+    this.flash = Math.max(0, this.flash - dt*5);
+    this.blockFlash = Math.max(0, this.blockFlash - dt*5);
+    if(this.attackCd > 0) this.attackCd -= dt;
+
+    const c = this.controls;
+    const dir = (held.has(c.left) ? -1 : 0) + (held.has(c.right) ? 1 : 0);
+    const down = held.has(c.down);
+    const jump = edge.has(c.up);
+    const punch = edge.has(c.punch);
+    const kick = edge.has(c.kick);
+    this.bob = 0;
+
+    // 受击硬直
+    if(this.hitstun > 0){
+      this.hitstun -= dt;
+      this.applyPhysics(dt);
+      this.x = clamp(this.x, ARENA_L, ARENA_R);
+      if(this.hitstun <= 0){ this.state = 'idle'; this.stateTime = 0; }
+      this.setStatePose('hit', 30);
+      return;
+    }
+    // 攻击（锁定移动）
+    if(this.state === 'punch' || this.state === 'kick'){
+      if(this.stateTime < 0.06) this.x += this.facing * 130 * dt;
+      this.applyPhysics(dt);
+      this.x = clamp(this.x, ARENA_L, ARENA_R);
+      if(!this.hasHit && this.stateTime >= this.activeA && this.stateTime <= this.activeB){
+        this.tryHit(enemy);
+      }
+      this.setStatePose(this.state, 26);
+      if(this.stateTime > (this.state === 'punch' ? 0.28 : 0.42)){
+        this.state = 'idle'; this.stateTime = 0;
+      }
+      return;
+    }
+
+    // 跳跃 / 移动
+    if(jump && this.onGround){ this.vy = -JUMP_VEL; sfx('jump'); }
+    this.vx = dir * MOVE_SPEED;
+    this.applyPhysics(dt);
+    this.x = clamp(this.x, ARENA_L, ARENA_R);
+    this.facing = enemy.x >= this.x ? 1 : -1;
+
+    // 攻击
+    if(punch && !down){ this.startAttack('punch'); return; }
+    if(kick && !down){ this.startAttack('kick'); return; }
+
+    // 姿态选择
+    if(down){ this.state = 'block'; this.setStatePose('block', 16); }
+    else if(!this.onGround){ this.state = 'jump'; this.setStatePose('jump', 16); }
+    else if(dir !== 0){
+      this.state = 'walk';
+      this.walkPhase += dt * 10;
+      this.bob = Math.abs(Math.sin(this.walkPhase)) * 2.5;
+      this.setWalkPose();
+    } else { this.state = 'idle'; this.setStatePose('idle', 10); }
+  }
+  interpAngles(dt){
+    const k = 1 - Math.exp(-this.lerpRate * dt);
+    for(const key in this.angles){
+      this.angles[key] = lerpAngle(this.angles[key], this.target[key], k);
+    }
+  }
+  draw(ctx){
+    const a = this.angles;
+    const y = this.y - this.bob;
+    const hipY = y - HIP_H;
+    const shoulderY = hipY - TORSO;
+    const headY = shoulderY - NECK - HEAD_R;
+    const T = ang => this.facing === 1 ? ang : Math.PI - ang;
+
+    ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.lineWidth = 4.5;
+    ctx.strokeStyle = this.flash > 0 ? '#ffffff' : this.color;
+
+    const limb = (ox,oy,a1,a2,l1,l2)=>{
+      const x1 = ox + Math.cos(a1)*l1, y1 = oy + Math.sin(a1)*l1;
+      const x2 = x1 + Math.cos(a2)*l2, y2 = y1 + Math.sin(a2)*l2;
+      ctx.moveTo(ox,oy); ctx.lineTo(x1,y1); ctx.lineTo(x2,y2);
+    };
+
+    // 后侧手臂
+    ctx.beginPath();
+    limb(this.x - 3*this.facing, shoulderY, T(a.buA), T(a.bF), UPPER_ARM, FORE_ARM);
+    ctx.stroke();
+    // 后侧腿
+    ctx.beginPath();
+    limb(this.x - 3*this.facing, hipY, T(a.bT), T(a.bS), THIGH, SHIN);
+    ctx.stroke();
+    // 躯干 + 脖子
+    ctx.beginPath();
+    ctx.moveTo(this.x, hipY); ctx.lineTo(this.x, shoulderY);
+    ctx.moveTo(this.x, shoulderY); ctx.lineTo(this.x, shoulderY - NECK);
+    ctx.stroke();
+    // 头
+    ctx.beginPath();
+    ctx.arc(this.x, headY, HEAD_R, 0, Math.PI*2);
+    ctx.stroke();
+    // 前侧腿
+    ctx.beginPath();
+    limb(this.x + 3*this.facing, hipY, T(a.fT), T(a.fS), THIGH, SHIN);
+    ctx.stroke();
+    // 前侧手臂
+    ctx.beginPath();
+    limb(this.x + 3*this.facing, shoulderY, T(a.fuA), T(a.fF), UPPER_ARM, FORE_ARM);
+    ctx.stroke();
+
+    // 防御时的护盾
+    if(this.blockFlash > 0){
+      ctx.save();
+      ctx.globalAlpha = this.blockFlash;
+      ctx.strokeStyle = '#8fd0ff';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(this.x + this.facing*38, shoulderY - 6, 26, -1.1, 1.1);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+// ==================== 粒子 ====================
+let sparks = [];
+function spawnSparks(x,y,color,n){
+  for(let i=0;i<n;i++){
+    const ang = Math.random()*Math.PI*2;
+    const sp = 120 + Math.random()*260;
+    sparks.push({x,y,vx:Math.cos(ang)*sp, vy:Math.sin(ang)*sp-70, life:0.5, color, r:2+Math.random()*2});
+  }
+}
+function updateParticles(dt){
+  for(let i=sparks.length-1;i>=0;i--){
+    const s = sparks[i];
+    s.life -= dt;
+    if(s.life <= 0){ sparks.splice(i,1); continue; }
+    s.x += s.vx*dt; s.y += s.vy*dt; s.vy += GRAVITY*0.5*dt;
+  }
+}
+function drawParticles(ctx){
+  for(const s of sparks){
+    ctx.globalAlpha = Math.max(0, s.life/0.5);
+    ctx.fillStyle = s.color;
+    ctx.beginPath();
+    ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+    ctx.fill();
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ==================== 玩家 ====================
+const players = [
+  new Stickman(300, '#ff4d4d', P1C),
+  new Stickman(W-300, '#4d9fff', P2C),
+];
+players[0].facing = 1; players[1].facing = -1;
+
+// ==================== 游戏状态 ====================
+let mode = 'menu'; // menu | countdown | playing | roundend | matchover
+let modeTimer = 0;
+let roundTimer = ROUND_TIME;
+let roundWins = [0,0];
+let round = 0;
+let banner = '';
+let fightFlash = 0;
+let shake = 0;
+
+function startMatch(){
+  roundWins = [0,0]; round = 0;
+  startRound();
+}
+function startRound(){
+  round++;
+  players.forEach((p,i)=>{
+    p.x = i === 0 ? 300 : W-300;
+    p.y = GROUND; p.vx = 0; p.vy = 0;
+    p.hp = p.maxHp;
+    p.state = 'idle'; p.stateTime = 0;
+    p.hitstun = 0; p.attackCd = 0;
+    p.flash = 0; p.blockFlash = 0; p.walkPhase = 0; p.bob = 0;
+    p.angles = {...POSES.idle}; p.target = {...POSES.idle};
+    p.facing = i === 0 ? 1 : -1;
+  });
+  roundTimer = ROUND_TIME;
+  mode = 'countdown'; modeTimer = 1.5;
+  hideOverlay();
+}
+function endRound(winner){
+  if(winner >= 0) roundWins[winner]++;
+  mode = 'roundend'; modeTimer = 2.2;
+  if(winner >= 0){
+    banner = (winner === 0 ? '玩家 1' : '玩家 2') + ' 赢得本回合！';
+    sfx(roundWins[winner] >= 2 ? 'win' : 'ko');
+  } else {
+    banner = '时间到，平局！';
+    sfx('ko');
+  }
+}
+
+// ==================== 覆盖层 ====================
+function menuHTML(){
+  return `
+    <div class="panel">
+      <h1>🔥 火柴人大战</h1>
+      <div class="sub">双人对战 · 三局两胜</div>
+      <div class="controls">
+        <div class="col">
+          <h3 style="color:#ff6b6b">玩家 1（红）</h3>
+          <div class="row"><span>移动</span><span><kbd>A</kbd> <kbd>D</kbd></span></div>
+          <div class="row"><span>跳跃</span><kbd>W</kbd></div>
+          <div class="row"><span>防御</span><kbd>S</kbd></div>
+          <div class="row"><span>拳击</span><kbd>F</kbd></div>
+          <div class="row"><span>踢击</span><kbd>G</kbd></div>
+        </div>
+        <div class="col">
+          <h3 style="color:#6bb5ff">玩家 2（蓝）</h3>
+          <div class="row"><span>移动</span><span><kbd>←</kbd> <kbd>→</kbd></span></div>
+          <div class="row"><span>跳跃</span><kbd>↑</kbd></div>
+          <div class="row"><span>防御</span><kbd>↓</kbd></div>
+          <div class="row"><span>拳击</span><kbd>J</kbd></div>
+          <div class="row"><span>踢击</span><kbd>K</kbd></div>
+        </div>
+      </div>
+      <button>开始游戏</button>
+      <div class="hint">也可以按 <b>空格</b> 开始 · 按 <b>M</b> 静音</div>
+    </div>`;
+}
+function matchHTML(winner){
+  return `
+    <div class="panel">
+      <h1>🏆 ${winner} 获胜！</h1>
+      <div class="sub">精彩的对决！</div>
+      <button>再来一局</button>
+      <div class="hint">按 <b>空格</b> 重新开始</div>
+    </div>`;
+}
+function showOverlay(html){ overlay.innerHTML = html; overlay.style.display = 'flex'; }
+function hideOverlay(){ overlay.style.display = 'none'; }
+
+overlay.addEventListener('click', ()=>{
+  if(mode === 'menu' || mode === 'matchover') startMatch();
+});
+muteBtn.addEventListener('click', ()=>{
+  muted = !muted; muteBtn.textContent = muted ? '🔇' : '🔊'; ensureAudio();
+});
+
+// ==================== 渲染 ====================
+function drawBackground(){
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#1a1a2e'); g.addColorStop(0.55,'#16213e'); g.addColorStop(1,'#0f3460');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+  // 双方领土氛围光
+  let side = ctx.createLinearGradient(0,0,W*0.5,0);
+  side.addColorStop(0,'rgba(255,80,80,0.07)'); side.addColorStop(1,'rgba(255,80,80,0)');
+  ctx.fillStyle = side; ctx.fillRect(0,0,W*0.5,H);
+  side = ctx.createLinearGradient(W,0,W*0.5,0);
+  side.addColorStop(0,'rgba(80,150,255,0.07)'); side.addColorStop(1,'rgba(80,150,255,0)');
+  ctx.fillStyle = side; ctx.fillRect(W*0.5,0,W*0.5,H);
+
+  // 月亮
+  ctx.fillStyle = 'rgba(255,255,255,0.06)';
+  ctx.beginPath(); ctx.arc(W-150,110,92,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,0.10)';
+  ctx.beginPath(); ctx.arc(W-150,110,70,0,Math.PI*2); ctx.fill();
+
+  // 远山
+  ctx.fillStyle = 'rgba(0,0,0,0.28)';
+  ctx.beginPath(); ctx.moveTo(0,GROUND); ctx.lineTo(0,320); ctx.lineTo(150,220); ctx.lineTo(300,330); ctx.lineTo(470,240); ctx.lineTo(640,340); ctx.lineTo(820,250); ctx.lineTo(W,320); ctx.lineTo(W,GROUND); ctx.closePath(); ctx.fill();
+
+  // 地面
+  ctx.fillStyle = '#1b1b2f'; ctx.fillRect(0,GROUND,W,H-GROUND);
+  const lg = ctx.createLinearGradient(0,GROUND,0,GROUND+60);
+  lg.addColorStop(0,'rgba(120,180,255,0.32)'); lg.addColorStop(1,'rgba(120,180,255,0)');
+  ctx.fillStyle = lg; ctx.fillRect(0,GROUND,W,60);
+  ctx.strokeStyle = 'rgba(140,200,255,0.55)'; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(0,GROUND); ctx.lineTo(W,GROUND); ctx.stroke();
+  ctx.strokeStyle = 'rgba(255,255,255,0.04)'; ctx.lineWidth = 1;
+  for(let x=0;x<=W;x+=40){ ctx.beginPath(); ctx.moveTo(x,GROUND); ctx.lineTo(x,H); ctx.stroke(); }
+}
+function drawShadow(p){
+  const h = GROUND - p.y;
+  const s = Math.max(0.25, 1 - h/620);
+  ctx.fillStyle = 'rgba(0,0,0,0.35)';
+  ctx.beginPath();
+  ctx.ellipse(p.x, GROUND+13, 34*s, 8*s, 0, 0, Math.PI*2);
+  ctx.fill();
+}
+function drawHealthBar(p, x, y, w, hgt){
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  roundRect(x,y,w,hgt,5); ctx.fill();
+  const ratio = clamp(p.hp/p.maxHp, 0, 1);
+  const g = ctx.createLinearGradient(x,0,x+w,0);
+  g.addColorStop(0, p.color); g.addColorStop(1, '#ffffff');
+  ctx.fillStyle = g;
+  if(ratio > 0){ roundRect(x,y,w*ratio,hgt,5); ctx.fill(); }
+  ctx.strokeStyle = 'rgba(255,255,255,0.55)'; ctx.lineWidth = 1.5;
+  roundRect(x,y,w,hgt,5); ctx.stroke();
+}
+function drawPips(x, y, idx){
+  for(let i=0;i<2;i++){
+    const px = idx === 0 ? x + i*22 : x - i*22;
+    ctx.beginPath();
+    ctx.arc(px, y, 7, 0, Math.PI*2);
+    ctx.fillStyle = i < roundWins[idx] ? players[idx].color : 'rgba(255,255,255,0.14)';
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,255,255,0.35)'; ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+}
+function drawBanner(text, alpha){
+  ctx.save();
+  ctx.globalAlpha = alpha == null ? 1 : alpha;
+  ctx.textAlign = 'center';
+  ctx.font = 'bold 58px "Segoe UI","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = '#ffffff';
+  ctx.shadowColor = '#000'; ctx.shadowBlur = 18;
+  ctx.fillText(text, W/2, H/2 - 16);
+  ctx.restore();
+}
+function drawUI(){
+  // 血条 + 名字
+  drawHealthBar(players[0], 24, 24, 340, 22);
+  drawHealthBar(players[1], W-24-340, 24, 340, 22);
+  ctx.textAlign = 'left'; ctx.font = 'bold 16px "Segoe UI","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = '#ff8a8a'; ctx.fillText('玩家 1', 24, 66);
+  ctx.textAlign = 'right'; ctx.fillStyle = '#8ab8ff'; ctx.fillText('玩家 2', W-24, 66);
+  drawPips(28, 84, 0); drawPips(W-28, 84, 1);
+
+  // 计时器
+  ctx.textAlign = 'center';
+  ctx.fillStyle = roundTimer <= 10 ? '#ff6b6b' : '#ffffff';
+  ctx.font = 'bold 36px "Segoe UI","Microsoft YaHei",sans-serif';
+  ctx.fillText(Math.ceil(roundTimer), W/2, 54);
+  ctx.font = '13px "Segoe UI","Microsoft YaHei",sans-serif';
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  ctx.fillText('第 ' + round + ' 回合', W/2, 76);
+
+  // 瞬时横幅
+  if(mode === 'countdown') drawBanner('第 ' + round + ' 回合');
+  if(fightFlash > 0) drawBanner('开打！', fightFlash);
+  if(mode === 'roundend') drawBanner(banner);
+  if(mode === 'matchover'){
+    const w = roundWins[0] >= 2 ? 0 : 1;
+    drawBanner('玩家 ' + (w+1) + ' 获胜！');
+  }
+}
+function render(){
+  ctx.clearRect(0,0,W,H);
+  drawBackground();
+  ctx.save();
+  if(shake > 0) ctx.translate((Math.random()-0.5)*shake, (Math.random()-0.5)*shake);
+  players.forEach(p=>drawShadow(p));
+  players.forEach(p=>p.draw(ctx));
+  drawParticles(ctx);
+  ctx.restore();
+  drawUI();
+}
+
+// ==================== 主循环 ====================
+let last = 0;
+function loop(ts){
+  const dt = Math.min(0.033, (ts - last)/1000 || 0.016);
+  last = ts;
+
+  if(mode === 'playing'){
+    roundTimer -= dt;
+    players.forEach(p=>p.update(dt, p.enemy));
+    for(let i=0;i<2;i++){
+      if(players[i].hp <= 0){ endRound(1-i); break; }
+    }
+    if(mode === 'playing' && roundTimer <= 0){
+      roundTimer = 0;
+      if(players[0].hp > players[1].hp) endRound(0);
+      else if(players[1].hp > players[0].hp) endRound(1);
+      else endRound(-1);
+    }
+  } else if(mode === 'countdown' || mode === 'roundend'){
+    modeTimer -= dt;
+    if(mode === 'countdown' && modeTimer <= 0){ mode = 'playing'; fightFlash = 0.8; }
+    else if(mode === 'roundend' && modeTimer <= 0){
+      if(roundWins[0] >= 2 || roundWins[1] >= 2){
+        mode = 'matchover';
+        const w = roundWins[0] >= 2 ? 0 : 1;
+        showOverlay(matchHTML('玩家 ' + (w+1)));
+      } else {
+        startRound();
+      }
+    }
+  }
+  players.forEach(p=>p.interpAngles(dt));
+  updateParticles(dt);
+  shake = Math.max(0, shake - dt*40);
+  fightFlash = Math.max(0, fightFlash - dt);
+
+  edge.clear();
+  render();
+  requestAnimationFrame(loop);
+}
+
+// 绑定敌人引用
+players[0].enemy = players[1];
+players[1].enemy = players[0];
+
+showOverlay(menuHTML());
+requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
